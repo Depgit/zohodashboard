@@ -1,0 +1,18 @@
+{
+  "name": "zoho-books-dashboard",
+  "version": "1.0.0",
+  "description": "Zoho Books Dashboard for India",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "build": "next build",
+    "dev": "npx nodemon server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "express-session": "^1.17.3",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "cors": "^2.8.5"
+  }
+}
