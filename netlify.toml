@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────
+# Netlify Configuration – Zoho Books Dashboard
+# ─────────────────────────────────────────────
+
+[build]
+  # No build step needed — static frontend + serverless functions
+  publish = "public"
+  functions = "netlify/functions"
+
+# Redirect ALL API & OAuth requests to the Express serverless function
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/api/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/oauth/*"
+  to = "/.netlify/functions/api/oauth/:splat"
+  status = 200
+
+# SPA fallback — any other path serves index.html
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
