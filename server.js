@@ -96,9 +96,6 @@ app.get('/oauth/start', requireLogin, (req, res) => {
   const state = Math.random().toString(36).substring(2);
   req.session.oauthState = state;
 
-  // console.log('[oauth/start] starting OAuth, state:', state);
-  // console.log('[oauth/start] session before redirect:', JSON.stringify(req.session));
-
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: process.env.ZOHO_CLIENT_ID,
@@ -110,15 +107,12 @@ app.get('/oauth/start', requireLogin, (req, res) => {
   });
 
   const zohoLoginURL = `${process.env.ZOHO_DOMAIN}/oauth/v2/auth?${params}`;
-  console.log('[oauth/start] redirecting to:', zohoLoginURL);
+  // console.log('[oauth/start] redirecting to:', zohoLoginURL);
   res.redirect(zohoLoginURL);
 });
 
 app.get('/oauth/callback', async (req, res) => {
   const { code, error, state } = req.query;
-
-  // console.log('[oauth/callback] query params:', req.query);
-  // console.log('[oauth/callback] session at callback:', JSON.stringify(req.session));
 
   if (error) {
     console.error('[oauth/callback] Zoho returned error:', error);
@@ -137,7 +131,6 @@ app.get('/oauth/callback', async (req, res) => {
   }
 
   try {
-    // console.log('[oauth/callback] exchanging code for tokens...');
 
     const tokenRes = await axios.post(
       `${process.env.ZOHO_DOMAIN}/oauth/v2/token`,
@@ -153,7 +146,6 @@ app.get('/oauth/callback', async (req, res) => {
       }
     );
 
-    // console.log('[oauth/callback] token response:', JSON.stringify(tokenRes.data));
 
     const { access_token, refresh_token, error: tokenError } = tokenRes.data;
 
@@ -167,15 +159,12 @@ app.get('/oauth/callback', async (req, res) => {
       { headers: { Authorization: `Zoho-oauthtoken ${access_token}` } }
     );
 
-    console.log('orgRes.data.organizations', orgRes.data.organizations[1]);
     const org_id =
       orgRes.data.organizations && orgRes.data.organizations.length > 1
         ? orgRes.data.organizations[1].organization_id
         : null;
 
-    console.log('[oauth/callback] org_id:', org_id);
 
-    // FIX: Explicitly reassign the whole zohoTokens object
     const tokens = {
       access_token,
       refresh_token: refresh_token || null,
@@ -185,13 +174,8 @@ app.get('/oauth/callback', async (req, res) => {
 
     req.session.zohoTokens = tokens;
 
-    // FIX: Verify it was actually stored
-    // console.log('[oauth/callback] tokens saved to session:', JSON.stringify(req.session.zohoTokens));
-    // console.log('[oauth/callback] full session after save:', JSON.stringify(req.session));
 
-    // FIX: Check cookie size - warn if approaching limit
     const sessionSize = JSON.stringify(req.session).length;
-    // console.log('[oauth/callback] session size in bytes:', sessionSize);
     if (sessionSize > 3000) {
       console.warn('[oauth/callback] WARNING: Session approaching 4KB cookie limit!', sessionSize, 'bytes');
     }
@@ -210,7 +194,7 @@ async function refreshAccessToken(req) {
   const t = getTokens(req);
   if (!t || !t.refresh_token) throw new Error('No refresh token available');
 
-  console.log('[refreshToken] refreshing access token...');
+  // console.log('[refreshToken] refreshing access token...');
 
   const response = await axios.post(
     `${process.env.ZOHO_DOMAIN}/oauth/v2/token`,
@@ -225,7 +209,7 @@ async function refreshAccessToken(req) {
     }
   );
 
-  console.log('[refreshToken] response:', JSON.stringify(response.data));
+  // console.log('[refreshToken] response:', JSON.stringify(response.data));
 
   if (!response.data.access_token) {
     throw new Error('Refresh token response missing access_token: ' + JSON.stringify(response.data));
@@ -238,7 +222,7 @@ async function refreshAccessToken(req) {
     last_synced: new Date().toISOString()
   };
 
-  console.log('[refreshToken] new token saved');
+  // console.log('[refreshToken] new token saved');
   return response.data.access_token;
 }
 
@@ -250,7 +234,7 @@ async function zohoGet(req, endpoint, params = {}) {
   const url = `${process.env.ZOHO_API_DOMAIN}${endpoint}`;
   const allParams = { organization_id: t.organization_id, ...params };
 
-  console.log(`[zohoGet] GET ${url}`, allParams);
+  // console.log(`[zohoGet] GET ${url}`, allParams);
 
   try {
     const response = await axios.get(url, {
@@ -260,7 +244,7 @@ async function zohoGet(req, endpoint, params = {}) {
     return response.data;
   } catch (err) {
     if (err.response?.status === 401) {
-      console.log('[zohoGet] 401 - attempting token refresh...');
+      // console.log('[zohoGet] 401 - attempting token refresh...');
       const newToken = await refreshAccessToken(req);
       const response = await axios.get(url, {
         headers: { Authorization: `Zoho-oauthtoken ${newToken}` },
@@ -306,47 +290,347 @@ app.post('/api/zoho/disconnect', requireLogin, (req, res) => {
   res.json({ success: true });
 });
 
-// ---- INVOICES ----
-app.get('/api/invoices', requireLogin, async (req, res) => {
-  const t = getTokens(req);
-  console.log('[invoices] session tokens:', t ? 'present' : 'MISSING');
 
+// ============================================
+// BILLS CACHE
+// ============================================
+const billsCache = {
+  data: [],           // stored bills
+  dateRange: null,    // { from, to }
+  lastFetched: null,  // timestamp
+  ttl: 10000 * 60 * 1000 // 10000 minutes
+};
+
+function isCacheValid(from, to) {
+  if (!billsCache.lastFetched || !billsCache.data.length) return false;
+
+  const now = Date.now();
+  const isExpired = (now - billsCache.lastFetched) > billsCache.ttl;
+  if (isExpired) return false;
+
+  // Check if same date range
+  const isSameRange = billsCache.dateRange?.from === from &&
+    billsCache.dateRange?.to === to;
+
+  return isSameRange;
+}
+
+function clearBillsCache() {
+  billsCache.data = [];
+  billsCache.dateRange = null;
+  billsCache.lastFetched = null;
+  console.log('🗑️ Bills cache cleared');
+}
+
+// ============================================
+// FETCH & ENRICH BILLS
+// ============================================
+async function fetchAndEnrichBills(req, params, date_from, date_to) {
+  let allBills = [];
+  let page = 1;
+  let hasMorePages = true;
+
+  // Step 1: Fetch all bills from list API
+  while (hasMorePages) {
+    const pageParams = { ...params, page, per_page: 200 };
+    const data = await zohoGet(req, '/bills', pageParams);
+    const bills = data.bills || [];
+    allBills = allBills.concat(bills);
+
+    hasMorePages = data.page_context?.has_more_page || false;
+    page++;
+
+    if (allBills.length >= 1000 || page > 50) {
+      console.log(`⚠️ Stopped at ${allBills.length} bills`);
+      break;
+    }
+  }
+
+  console.log(`📦 Fetched ${allBills.length} bills from Zoho`);
+
+  // Step 2: Enrich with full details (for custom fields)
+  if (allBills.length > 0 && allBills.length <= 500) {
+    console.log(`🔍 Enriching ${allBills.length} bills with details...`);
+
+    const batchSize = 10;
+    const enrichedBills = [];
+
+    for (let i = 0; i < allBills.length; i += batchSize) {
+      const batch = allBills.slice(i, i + batchSize);
+
+      const detailPromises = batch.map(async (bill) => {
+        try {
+          const detail = await zohoGet(req, `/bills/${bill.bill_id}`, {});
+          const fullBill = detail.bill || {};
+          return {
+            ...bill,
+            cf_expense_related_month: fullBill.custom_field_hash?.cf_expense_related_month || '',
+            custom_field_hash: fullBill.custom_field_hash || {},
+            line_items: fullBill.line_items || [],
+            reporting_tags: fullBill.line_items?.flatMap(item => item.tags || []) || []
+          };
+        } catch (err) {
+          console.error(`❌ Failed to enrich bill ${bill.bill_id}:`, err.message);
+          return bill;
+        }
+      });
+
+      const batchResults = await Promise.all(detailPromises);
+      enrichedBills.push(...batchResults);
+
+      console.log(`   ✅ Enriched ${Math.min(i + batchSize, allBills.length)}/${allBills.length}`);
+
+      if (i + batchSize < allBills.length) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+
+    allBills = enrichedBills;
+  }
+
+  // Step 3: Store in cache
+  billsCache.data = allBills;
+  billsCache.dateRange = { from: date_from, to: date_to };
+  billsCache.lastFetched = Date.now();
+
+  console.log(`💾 Cached ${allBills.length} bills`);
+  return allBills;
+}
+
+// ============================================
+// MAIN BILLS ROUTE
+// ============================================
+app.get('/api/bills', requireLogin, async (req, res) => {
+  const t = getTokens(req);
   if (!t || !t.access_token) {
-    return res.status(400).json({
-      error: 'Zoho not connected',
-      debug: 'No access_token in session. Please reconnect Zoho.'
-    });
+    return res.status(400).json({ error: 'Zoho not connected' });
   }
 
   try {
-    const { status, date_from, date_to, page = 1 } = req.query;
-    const params = { page, per_page: 50 };
-    if (status && status !== 'all') params.status = status;
-    if (date_from) params.date_start = date_from;
-    if (date_to) params.date_end = date_to;
+    let {
+      status,
+      date_from,
+      date_to,
+      due_date_from,
+      due_date_to,
+      vendor_id,
+      vendor_name,
+      total_min,
+      total_max,
+      cf_expense_related_month,
+      cf_nature_of_expense,
+      bill_number,
+      reference_number,
+      search_text,
+      sort_column,
+      sort_order
+    } = req.query;
 
-    const data = await zohoGet(req, '/invoices', params);
-    const invoices = data.invoices || [];
+    // ✅ If NO date filter → default to last 1 month
+    const hasDateFilter = date_from || date_to;
+    if (!hasDateFilter) {
+      const now = new Date();
+      const oneMonthAgo = new Date(now);
+      oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+      date_from = oneMonthAgo.toISOString().split('T')[0];
+      date_to = now.toISOString().split('T')[0];
+      console.log(`📅 Default: Last 1 month (${date_from} to ${date_to})`);
+    }
 
+    let allBills = [];
+
+    // ✅ Check cache first
+    if (isCacheValid(date_from, date_to)) {
+      console.log(`⚡ Cache HIT - returning ${billsCache.data.length} cached bills`);
+      allBills = billsCache.data;
+    } else {
+      console.log(`🔄 Cache MISS - fetching from Zoho...`);
+
+      // Build base params for Zoho API
+      const baseParams = {};
+      if (date_from) baseParams.date_start = date_from;
+      if (date_to) baseParams.date_end = date_to;
+      if (due_date_from) baseParams.due_date_start = due_date_from;
+      if (due_date_to) baseParams.due_date_end = due_date_to;
+      if (sort_column) baseParams.sort_column = sort_column;
+      if (sort_order) baseParams.sort_order = sort_order;
+
+      // NOTE: Don't pass status/vendor etc to Zoho when caching
+      // We filter those client-side so cache can be reused across filters
+
+      allBills = await fetchAndEnrichBills(req, baseParams, date_from, date_to);
+    }
+
+    // ============================================
+    // CLIENT-SIDE FILTERING (always applied)
+    // ============================================
+    let filteredBills = [...allBills];
+
+    if (status && status !== 'all') {
+      filteredBills = filteredBills.filter(b => b.status === status);
+    }
+
+    if (cf_expense_related_month) {
+      filteredBills = filteredBills.filter(bill => {
+        const val = bill.cf_expense_related_month
+          || bill.custom_field_hash?.cf_expense_related_month
+          || '';
+        return val.toLowerCase().includes(cf_expense_related_month.toLowerCase());
+      });
+    }
+
+    if (cf_nature_of_expense) {
+      filteredBills = filteredBills.filter(bill => {
+        const val = bill.cf_nature_of_expense
+          || bill.custom_field_hash?.cf_nature_of_expense
+          || '';
+        return val.toLowerCase().includes(cf_nature_of_expense.toLowerCase());
+      });
+    }
+
+    if (vendor_name) {
+      filteredBills = filteredBills.filter(bill =>
+        (bill.vendor_name || '').toLowerCase().includes(vendor_name.toLowerCase())
+      );
+    }
+
+    if (vendor_id) {
+      filteredBills = filteredBills.filter(bill => bill.vendor_id === vendor_id);
+    }
+
+    if (bill_number) {
+      filteredBills = filteredBills.filter(bill =>
+        (bill.bill_number || '').toLowerCase().includes(bill_number.toLowerCase())
+      );
+    }
+
+    if (reference_number) {
+      filteredBills = filteredBills.filter(bill =>
+        (bill.reference_number || '').toLowerCase().includes(reference_number.toLowerCase())
+      );
+    }
+
+    if (search_text) {
+      const s = search_text.toLowerCase();
+      filteredBills = filteredBills.filter(bill =>
+        (bill.bill_number || '').toLowerCase().includes(s) ||
+        (bill.vendor_name || '').toLowerCase().includes(s) ||
+        (bill.reference_number || '').toLowerCase().includes(s)
+      );
+    }
+
+    if (total_min) {
+      filteredBills = filteredBills.filter(bill => parseFloat(bill.total) >= parseFloat(total_min));
+    }
+
+    if (total_max) {
+      filteredBills = filteredBills.filter(bill => parseFloat(bill.total) <= parseFloat(total_max));
+    }
+
+    console.log(`✅ Filtered: ${filteredBills.length} / ${allBills.length}`);
+
+    // Summary
     const summary = {
       paid: { count: 0, amount: 0 },
       pending: { count: 0, amount: 0 },
       overdue: { count: 0, amount: 0 },
-      total: { count: invoices.length, amount: 0 }
+      pending_approval: { count: 0, amount: 0 },
+      draft: { count: 0, amount: 0 },
+      total: { count: filteredBills.length, amount: 0 }
     };
 
-    invoices.forEach(inv => {
-      const amt = parseFloat(inv.total) || 0;
+    filteredBills.forEach(bill => {
+      const amt = parseFloat(bill.total) || 0;
       summary.total.amount += amt;
-      if (inv.status === 'paid') { summary.paid.count++; summary.paid.amount += amt; }
-      else if (inv.status === 'overdue') { summary.overdue.count++; summary.overdue.amount += amt; }
-      else { summary.pending.count++; summary.pending.amount += amt; }
+      switch (bill.status) {
+        case 'paid': summary.paid.count++; summary.paid.amount += amt; break;
+        case 'overdue': summary.overdue.count++; summary.overdue.amount += amt; break;
+        case 'pending_approval': summary.pending_approval.count++; summary.pending_approval.amount += amt; break;
+        case 'draft': summary.draft.count++; summary.draft.amount += amt; break;
+        default: summary.pending.count++; summary.pending.amount += amt; break;
+      }
     });
 
-    res.json({ invoices, summary, page_context: data.page_context });
+    res.json({
+      bills: filteredBills,
+      summary,
+      total_count: filteredBills.length,
+      fetched_count: allBills.length,
+      from_cache: isCacheValid(date_from, date_to),
+      date_range: { from: date_from, to: date_to },
+      is_default: !hasDateFilter,
+      cache_expires_in: billsCache.lastFetched
+        ? Math.max(0, Math.round((billsCache.ttl - (Date.now() - billsCache.lastFetched)) / 1000))
+        : 0
+    });
+
   } catch (err) {
-    console.error('[invoices] error:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Failed to fetch invoices', detail: err.message });
+    console.error('[bills] error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to fetch bills', detail: err.message });
+  }
+});
+
+// ============================================
+// FORCE REFRESH CACHE
+// ============================================
+app.post('/api/bills/refresh', requireLogin, (req, res) => {
+  clearBillsCache();
+  res.json({ message: '✅ Cache cleared. Next request will fetch fresh data.' });
+});
+
+// ============================================
+// CACHE STATUS
+// ============================================
+app.get('/api/bills/cache-status', requireLogin, (req, res) => {
+  const now = Date.now();
+  res.json({
+    has_cache: billsCache.data.length > 0,
+    cached_count: billsCache.data.length,
+    date_range: billsCache.dateRange,
+    last_fetched: billsCache.lastFetched
+      ? new Date(billsCache.lastFetched).toISOString()
+      : null,
+    expires_in_seconds: billsCache.lastFetched
+      ? Math.max(0, Math.round((billsCache.ttl - (now - billsCache.lastFetched)) / 1000))
+      : 0,
+    is_valid: billsCache.data.length > 0 && billsCache.lastFetched
+      ? (now - billsCache.lastFetched) < billsCache.ttl
+      : false
+  });
+});
+
+
+
+
+
+
+// Force refresh cache endpoint
+app.post('/api/bills/refresh-cache', requireLogin, async (req, res) => {
+  billsCache.lastFetched = null;
+  billsCache.data = [];
+  res.json({ message: 'Cache cleared. Next request will fetch fresh data.' });
+});
+
+// ✅ NEW route - Get single bill with ALL details
+app.get('/api/bills/:billId', requireLogin, async (req, res) => {
+  const t = getTokens(req);
+  if (!t || !t.access_token) {
+    return res.status(400).json({ error: 'Zoho not connected' });
+  }
+
+  try {
+    const { billId } = req.params;
+    const data = await zohoGet(req, `/bills/${billId}`, {});
+    const bill = data.bill;
+
+    if (!bill) {
+      return res.status(404).json({ error: 'Bill not found' });
+    }
+
+    res.json({ bill });
+  } catch (err) {
+    console.error('[bill-detail] error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to fetch bill details', detail: err.message });
   }
 });
 
